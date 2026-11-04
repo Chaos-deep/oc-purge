@@ -30,6 +30,9 @@ import {
 import { collectRules, ensureDirs, readCard, readInjectFile, listRuleFiles, readState, writeState, paths } from "../src/rules.js";
 import { promptPatches, toolPatches } from "../src/patches.js";
 import { allowNetwork, hostsInCommand } from "../src/scope.js";
+import { EvidenceLedger } from "../src/evidence.js";
+import { recordToolCall } from "../src/observe.js";
+import { makeTools } from "./tools.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(HERE, "..");
@@ -50,6 +53,8 @@ const DEFAULTS = {
   verbose: false,
   postPrompt: "",
   systemMode: "append",
+  autoEvidence: true,
+  autoRecordToolCalls: true,
 };
 
 const log = (options, ...args) => {
@@ -132,7 +137,46 @@ export default {
     const gate = { ...cfg.scope };
     log(cfg, "loaded, inject bytes:", injectText.length);
 
+    /* ---- 运行期探针：给 purge_doctor 提供"这一层到底跑没跑"的事实 ---- */
+    const probe = {
+      injectBytes: injectText.length,
+      capabilityProtocol: true,
+      lastCardApplied: false,
+      lastCardModel: "",
+      permissionAutoAllow: cfg.permissionAutoAllow !== false,
+      permissionHookSeen: 0,
+      hookBypass: cfg.hookBypass !== false,
+      toolBeforeSeen: 0,
+      autoEvidence: cfg.autoEvidence !== false,
+      evidenceCount: 0,
+      retryEnabled: false,
+      retrySeen: 0,
+      scopeEnabled: gate.enabled === true,
+      scopeChecks: 0,
+      commandsRegistered: 0,
+      toolsRegistered: 0,
+      refusalWatch: false,
+      refusalSeen: 0,
+      shellRewrite: false,
+      shellSeen: 0,
+      compactEnabled: false,
+      compactRuns: 0,
+      compactTruncated: 0,
+    };
+
+    /* ---- 证据账本 + 工具面 ---- */
+    let ledger = null;
+    try {
+      ledger = new EvidenceLedger({ file: path.join(paths.root(env), "evidence.jsonl") });
+    } catch (error) {
+      log(cfg, "ledger init failed", String(error?.message ?? error));
+    }
+    const tools = makeTools({ cfg, env, probe, ledger });
+    probe.toolsRegistered = Object.keys(tools).length;
+    log(cfg, "tools registered:", probe.toolsRegistered);
+
     return {
+      tool: tools,
       /** 系统提示词：append 到最后一个 system 段（等价于 2.x 的 session.hook("context")）。 */
       "experimental.chat.system.transform": async (input, output) => {
         const system = output?.system;
@@ -140,6 +184,8 @@ export default {
         const modelRef = `${input?.model?.providerID ?? ""}/${input?.model?.id ?? input?.model?.modelID ?? ""}`;
         const card = resolveCard(cfg, env, modelRef);
         const block = renderIdentityCard({ card, primeDirective: cfg.primeDirective });
+        probe.lastCardModel = modelRef;
+        probe.lastCardApplied = Boolean(block);
         for (const [index, part] of system.entries()) {
           if (typeof part !== "string") continue;
           system[index] = appendOnce(applyPromptPatches(cfg, part), injectText);
@@ -155,6 +201,7 @@ export default {
 
       /** 工具调用前：参数归一化 + 作用域闸门。 */
       "tool.execute.before": async (input, output) => {
+        probe.toolBeforeSeen += 1;
         if (cfg.hookBypass && output && typeof output === "object" && output.args) {
           for (const patch of toolPatches) {
             try {
@@ -163,6 +210,7 @@ export default {
           }
         }
         if (gate.enabled && output?.args) {
+          probe.scopeChecks += 1;
           const command = output.args.command;
           if (typeof command === "string") {
             for (const host of hostsInCommand(command)) {
@@ -177,29 +225,29 @@ export default {
             if (!verdict.allowed) throw new Error(`[oc-purge] out-of-scope host ${value} (${verdict.reason})`);
           }
         }
-        // 新工具：让 1.19 也能调用 purge_rules / purge_inject / purge_status
-        if (input?.tool === "purge_status") {
-          const state = readState(env);
-          output.args = {
-            __ocpurge_result: [
-              `enabled: ${cfg.enabled}`,
-              `rules: ${listRuleFiles(env).filter((r) => state.rules.includes(r.id) || state.rules.length === 0).map((r) => r.id).join(",") || "(none)"}`,
-              `scope: ${JSON.stringify(gate)}`,
-              `inject: ${readInjectFile(env).length} bytes`,
-            ].join("\n"),
-          };
-        }
+        log(cfg, "tool.before", input?.tool);
       },
 
-      /** 工具调用后：把 purge_status 的伪结果替换掉。 */
+      /** 工具调用后：自动把结果记进证据账本。 */
       "tool.execute.after": async (input, output) => {
-        if (input?.tool !== "purge_status") return;
-        const text = input?.args?.__ocpurge_result;
-        if (typeof text === "string" && output && typeof output === "object") output.output = text;
+        if (!ledger || !cfg.autoEvidence || cfg.autoRecordToolCalls === false) return;
+        const name = String(input?.tool || "");
+        if (!name || name.startsWith("purge_")) return;
+        const result = recordToolCall(ledger, {
+          tool: name,
+          input: input?.args,
+          output: output?.output ?? output?.title ?? "",
+          ok: true,
+          sessionID: input?.sessionID,
+          agent: input?.agent,
+        });
+        if (result.ok) probe.evidenceCount += 1;
+        log(cfg, "evidence recorded", result.ev_id ?? result.error);
       },
 
       /** 权限：把 ask → allow（deny 不动）。1.19 的 payload 里没有 effect，只能改 status。 */
       "permission.ask": async (_input, output) => {
+        probe.permissionHookSeen += 1;
         if (!cfg.permissionAutoAllow) return;
         const allowAny = !Array.isArray(cfg.permissionAllowActions) || cfg.permissionAllowActions.includes("*");
         if (!allowAny && !cfg.permissionAllowActions.includes(_input?.permission)) return;

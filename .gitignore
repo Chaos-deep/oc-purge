@@ -3,3 +3,11 @@ test/.ocpurge-home*/
 .ocpurge-home*/
 package-lock.json
 *.tgz
+
+# local runtime data (not part of the plugin code)
+rules/
+cards/
+state.json
+evidence.jsonl
+prompt-inject.md
+*.bak

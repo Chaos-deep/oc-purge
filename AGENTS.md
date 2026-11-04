@@ -16,12 +16,13 @@
 - 一切注入必须**幂等**：多轮、多 hook、热重载都不能叠出第二份。
 - `transform` 回调是同步的，读盘一律在 `setup()` / `server()` 里提前 `await`。
 - 除 `@opencode/plugin` 与 `effect`（peer）外不引第三方依赖。
+- 证据账本 `src/evidence.js` 的哈希口径（`canonicalize` + `sanitizeForHash`）改动会让历史 ev_id 全部失效，动它要有迁移方案。
 - 测试不依赖真实 opencode：`test/harness.mjs` 是按 `packages/core/src/plugin/host.ts` 语义写的替身。
 
 ## 命令
 
 ```bash
-npm test                        # 13 项，全绿才算可发布（内置 @opencode/plugin 替身）
+npm test                        # 41 项，全绿才算可发布（内置 @opencode/plugin 替身）
 node --check src/index.js
 ```
 

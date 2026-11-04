@@ -38,6 +38,10 @@ import {
 import { collectRules, ensureDirs, readCard, readInjectFile, listRuleFiles, readState, writeState, paths } from "./rules.js";
 import { agentPatch, promptPatches, toolPatches } from "./patches.js";
 import { allowNetwork, installScopeGate, scopeReport } from "./scope.js";
+import { capabilityProtocolText, renderSkillCatalog } from "./capability.js";
+import { decideRetry, normalizeRetryConfig } from "./retry.js";
+import { EvidenceLedger } from "./evidence.js";
+import { evidenceFromEvent, recordToolCall } from "./observe.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(HERE, "..");
@@ -60,6 +64,14 @@ const DEFAULTS = {
   dropTools: [],
   skillsDir: path.join(PACKAGE_ROOT, "skills"),
   agentsDir: path.join(PACKAGE_ROOT, "agents"),
+  // 让模型先查 skill / MCP 目录再动手（capability-protocol.js）
+  capabilityProtocol: true,
+  // 从事件流自动攒证据；关掉则只有手动 purge_evidence
+  autoEvidence: true,
+  // 重试策略（retry.js）
+  retry: { autoRetry: true, retryMax: 3 },
+  // 命令面板：/purge 系列
+  commands: true,
 };
 
 const log = (options, ...args) => {
@@ -71,6 +83,7 @@ function config(options) {
   merged.rules = Array.isArray(merged.rules) ? merged.rules : [];
   merged.cardByModel = merged.cardByModel && typeof merged.cardByModel === "object" ? merged.cardByModel : {};
   merged.scope = { ...DEFAULTS.scope, ...(merged.scope || {}) };
+  merged.retry = normalizeRetryConfig({ ...DEFAULTS.retry, ...(merged.retry || {}) });
   return merged;
 }
 
@@ -112,13 +125,9 @@ async function buildInjectText(cfg, ctx, env) {
   const card =
     readCard(env, pickPromptOverridesKey(cfg.cardByModel, cfg)) || cfg.card || readCard(env, "default");
   const skills = await readSkillCatalog(cfg.skillsDir);
-  const skillList = skills.length
-    ? [
-        "## Capability discovery (skills / MCP)",
-        "Before improvising, check whether a skill covers the request; load it and follow its methods.",
-        ...skills.map((s) => `- ${s.name}: ${s.description}`),
-      ].join("\n")
-    : "";
+  const skillList = [renderSkillCatalog(skills), capabilityProtocolText(cfg.capabilityProtocol)]
+    .filter((item) => String(item || "").trim())
+    .join("\n\n");
   const inject = readInjectFile(env);
   const blocks = [
     renderIdentityCard({ card, rules, primeDirective: cfg.primeDirective }),
@@ -187,6 +196,42 @@ export const plugin = Plugin.define({
       } catch {}
     };
     trace(`setup start inject=${injectText.length}`);
+
+    /* ---- 3.0 证据账本 + 事件订阅（自动攒证据）---- */
+    let ledger = null;
+    try {
+      ledger = new EvidenceLedger({ file: path.join(paths.root(env), "evidence.jsonl") });
+    } catch (error) {
+      log(cfg, "ledger init failed", String(error?.message ?? error));
+    }
+    if (ledger && cfg.autoEvidence && cfg.autoRecordToolCalls !== false) {
+      const before = await ctx.tool.hook("execute.before", (event) => {
+        trace(`tool.before ${event.tool}`);
+      });
+      disposables.push(() => before.dispose());
+      const after = await ctx.tool.hook("execute.after", (event) => {
+        const ok = event.status === "completed";
+        const record = recordToolCall(ledger, {
+          tool: event.tool,
+          input: event.input,
+          output: ok ? event.result : event.error,
+          ok,
+          sessionID: event.sessionID,
+          agent: event.agent,
+        });
+        trace(`evidence ${ok ? "ok" : "fail"} ${record.ev_id ?? record.error}`);
+        log(cfg, "evidence recorded", record.ev_id ?? record.error);
+      });
+      disposables.push(() => after.dispose());
+    }
+
+    /* ---- 3.0b 重试策略：把 dsh-purge 的判定搬进 session.retry ---- */
+    const retryReg = await ctx.session.hook("retry", (event) => {
+      const decision = decideRetry({ error: event.error, attempt: event.attempt, config: cfg.retry });
+      trace(`retry attempt=${event.attempt} → ${decision.retry ? `delay ${decision.delay}` : "stop"} (${decision.reason})`);
+      event.decision = decision.retry ? { retry: true, delay: decision.delay } : { retry: false };
+    });
+    disposables.push(() => retryReg.dispose());
 
     /* ---- 3.1 agents：原生 agent 的 system 改写 + 注入专用 primary agent ---- */
     const agentsDir = cfg.agentsDir;
@@ -310,11 +355,40 @@ export const plugin = Plugin.define({
     }
 
     /* ---- 3.6 新增工具 / 技能 ---- */
-    const toolSpecs = makePurgeTools({ cfg, env });
+    const toolSpecs = makePurgeTools({ cfg, env, ledger });
     await ctx.tool.transform((tools) => {
       for (const tool of toolSpecs) tools.add(tool);
     });
     disposables.push(() => ctx.tool.reload());
+
+    if (cfg.commands && ctx.command?.transform) {
+      try {
+        await ctx.command.transform((editor) => {
+          const make = (name, description, body) => ({
+            name,
+            description,
+            execute: async ({ prompt }) => {
+              // 命令只是把一段固定文本塞进当前 prompt，不自己发请求
+              const text = typeof prompt === "object" && prompt ? prompt.text : prompt;
+              if (typeof prompt === "object" && prompt) prompt.text = `${body}\n\n${text ?? ""}`;
+            },
+          });
+          editor.add(
+            make("purge-status", "Show oc-purge state: rules, card, scope, evidence stats", "Call purge_status and purge_evidence(action=stats), then summarise."),
+          );
+          editor.add(
+            make("purge-evidence", "Summarise recorded evidence and unverified claims", "Call purge_evidence(action=stats) and purge_evidence(action=list, limit=20). Flag every claimed/inferred row that has not been verified."),
+          );
+          editor.add(
+            make("purge-release", "Publish the package via the npm workflow", "Check package.json version, run npm test, then tell the operator the exact gh workflow command for the chosen bump."),
+          );
+        });
+        disposables.push(() => ctx.command.reload?.());
+        trace("commands registered");
+      } catch (error) {
+        trace(`commands skipped: ${String(error?.message ?? error)}`);
+      }
+    }
 
     const skills = await readSkillCatalog(cfg.skillsDir);
     trace(`tools added=${toolSpecs.length} skills=${skills.length}`);
@@ -372,7 +446,7 @@ function stripFrontmatter(text) {
  * 4. 新增工具
  * ------------------------------------------------------------------ */
 
-export function makePurgeTools({ cfg, env }) {
+export function makePurgeTools({ cfg, env, ledger }) {
   const tool = (name, description, input, run) => ({
     name,
     options: { codemode: false },
@@ -457,8 +531,86 @@ export function makePurgeTools({ cfg, env }) {
         return `${verdict.allowed ? "ALLOW" : "DENY"}\t${verdict.reason}\t${host}`;
       },
     ),
+    tool(
+      "purge_evidence",
+      "Record / verify / list evidence in the local ledger. Evidence is content-addressed (ev_<sha256>): same content → same id, so a subagent's claim can be checked against what actually ran.",
+      Schema.Struct({
+        action: Schema.Literals(["record", "verify", "list", "stats", "open_unknown", "resolve_unknown", "unknowns"]),
+        operation: Schema.optional(Schema.String),
+        parameters: Schema.optional(Schema.Unknown),
+        result: Schema.optional(Schema.Unknown),
+        confidence: Schema.optional(Schema.Literals(["claimed", "observed", "derived", "inferred"])),
+        authority: Schema.optional(Schema.String),
+        limitations: Schema.optional(Schema.Array(Schema.String)),
+        question: Schema.optional(Schema.String),
+        severity: Schema.optional(Schema.Literals(["low", "medium", "high", "critical"])),
+        unk_id: Schema.optional(Schema.String),
+        status: Schema.optional(Schema.String),
+        resolution: Schema.optional(Schema.String),
+        limit: Schema.optional(Schema.Number),
+      }),
+      async (args) => {
+        if (!ledger) return "error: ledger unavailable";
+        const { action } = args;
+        if (action === "record") {
+          const out = ledger.record({
+            operation: args.operation,
+            parameters: args.parameters ?? {},
+            result: args.result,
+            confidence: args.confidence ?? "observed",
+            authority: args.authority ?? "operator-input",
+            limitations: args.limitations ?? [],
+          });
+          return out.ok ? `${out.duplicate ? "duplicate" : "recorded"} ${out.ev_id}` : `error: ${out.error}`;
+        }
+        if (action === "verify") {
+          const out = ledger.verify({
+            operation: args.operation,
+            parameters: args.parameters ?? {},
+            result: args.result,
+            confidence: args.confidence ?? "observed",
+            authority: args.authority ?? "operator-input",
+            limitations: args.limitations ?? [],
+          });
+          if (out.matched) return `MATCH ${out.expected_ev_id}`;
+          return `MISMATCH expected=${out.expected_ev_id} actual=${out.actual_ev_id ?? "(none)"}`;
+        }
+        if (action === "list") {
+          const rows = ledger.list({ limit: args.limit ?? 50 });
+          if (rows.length === 0) return "(no evidence)";
+          return rows
+            .map((row) => `${row.ev_id}\t${row.confidence}\t${row.operation}\t${String(row.result).slice(0, 80)}`)
+            .join("\n");
+        }
+        if (action === "stats") return JSON.stringify(ledger.stats(), null, 2);
+        if (action === "open_unknown") {
+          const out = ledger.openUnknown({
+            question: args.question,
+            severity: args.severity ?? "medium",
+          });
+          return out.ok ? `${out.duplicate ? "duplicate" : "opened"} ${out.unk_id}` : `error: ${out.error}`;
+        }
+        if (action === "resolve_unknown") {
+          const out = ledger.resolveUnknown({
+            unk_id: args.unk_id,
+            status: args.status ?? "resolved",
+            resolution: args.resolution,
+          });
+          return out.ok ? `${out.unk_id} → ${out.status}` : `error: ${out.error}`;
+        }
+        if (action === "unknowns") {
+          const rows = ledger.listUnknown({ status: args.status });
+          if (rows.length === 0) return "(no residual unknowns)";
+          return rows.map((row) => `${row.unk_id}\t${row.status}\t${row.severity}\t${row.question}`).join("\n");
+        }
+        return "noop";
+      },
+    ),
   ];
 }
 
 export { agentPatch, applyPromptPatches, DEFAULTS };
+export { EvidenceLedger } from "./evidence.js";
+export { decideRetry, decideContinue, normalizeRetryConfig } from "./retry.js";
+export { capabilityProtocolText, renderSkillCatalog } from "./capability.js";
 export default plugin;

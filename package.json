@@ -1,6 +1,6 @@
 {
   "name": "oc-purge",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "OpenCode 破甲插件：提示词注入 / 规则库 / 权限自动放行 / 网络作用域闸门 / 链式补丁。dsh-purge 的 OpenCode 移植（支持 2.2.0 + 1.19.x 双契约）。",
   "repository": {
     "type": "git",
@@ -20,6 +20,10 @@
     "./patches": "./src/patches.js",
     "./scope": "./src/scope.js",
     "./rules": "./src/rules.js",
+    "./evidence": "./src/evidence.js",
+    "./retry": "./src/retry.js",
+    "./capability": "./src/capability.js",
+    "./observe": "./src/observe.js",
     "./package.json": "./package.json",
     "./legacy": "./legacy/server.js"
   },

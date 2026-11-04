@@ -101,3 +101,57 @@ test("pickPromptOverrides 按模型挑卡", () => {
   assert.equal(prompt.pickPromptOverrides(map, "anthropic/claude-sonnet").card, "B");
   assert.deepEqual(prompt.pickPromptOverrides(map, "x/y"), {});
 });
+
+test("自动证据：tool.execute.after → 账本落账", async () => {
+  const { host, cleanup } = await boot();
+  await host.fire("tool", "execute.before", {
+    tool: "bash",
+    sessionID: "ses_ev",
+    agent: "build",
+    messageID: "m",
+    id: "c",
+    input: { command: "id" },
+  });
+  await host.fire("tool", "execute.after", {
+    tool: "bash",
+    sessionID: "ses_ev",
+    agent: "build",
+    messageID: "m",
+    id: "c",
+    input: { command: "id" },
+    status: "completed",
+    result: { content: "uid=0(root)" },
+  });
+  const ev = host.tools.find((t) => t.name === "purge_evidence");
+  assert.ok(ev, "purge_evidence 应该注册");
+  const stats = await ev.execute({ action: "stats" }, { signal: {} });
+  const parsed = JSON.parse(String(stats.content));
+  assert.equal(parsed.total, 1);
+  assert.equal(parsed.byConfidence.observed, 1);
+  await cleanup();
+});
+
+test("retry hook 对永久错误返回 retry:false", async () => {
+  const { host, cleanup } = await boot({ retry: { autoRetry: true, retryMax: 3 } });
+  const event = { error: { code: "UNAUTHORIZED", message: "bad key" }, attempt: 1, decision: { retry: true, delay: 1 } };
+  await host.fire("session", "retry", event);
+  assert.deepEqual(event.decision, { retry: false });
+  await cleanup();
+});
+
+test("retry hook 对限流给出较长延迟", async () => {
+  const { host, cleanup } = await boot();
+  const event = { error: { message: "429 rate limit" }, attempt: 0, decision: { retry: false } };
+  await host.fire("session", "retry", event);
+  assert.equal(event.decision.retry, true);
+  assert.ok(event.decision.delay >= 20_000);
+  await cleanup();
+});
+
+test("注入文本含 capability protocol 与 skill 目录", async () => {
+  const { host, cleanup } = await boot();
+  const general = host.agents.find((a) => a.id === "general");
+  assert.match(general.system, /Capability selection by task/);
+  assert.match(general.system, /Available skills/);
+  await cleanup();
+});

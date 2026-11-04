@@ -18,11 +18,14 @@
 - 除 `@opencode/plugin` 与 `effect`（peer）外不引第三方依赖。
 - 证据账本 `src/evidence.js` 的哈希口径（`canonicalize` + `sanitizeForHash`）改动会让历史 ev_id 全部失效，动它要有迁移方案。
 - 测试不依赖真实 opencode：`test/harness.mjs` 是按 `packages/core/src/plugin/host.ts` 语义写的替身。
+- `src/selfcheck.js` 的分母口径：只有 `off`/`na`/`disabled` 算不适用，`pending` 必须留在分母里。
+  改成"pending 也算通过"就等于自检永远 100%，这条被测试锁住（`test/selfcheck.test.mjs`）。
+- `src/replay.js` 合成出来的请求必须带 `synthesized: true`，不允许和真实抓包混为一谈。
 
 ## 命令
 
 ```bash
-npm test                        # 41 项，全绿才算可发布（内置 @opencode/plugin 替身）
+npm test                        # 87 项，全绿才算可发布（内置 @opencode/plugin 替身）
 node --check src/index.js
 ```
 

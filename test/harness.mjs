@@ -25,6 +25,7 @@ export function makeHost({ options = {}, agentSystem = "You are a coding agent."
   ];
   const tools = [];
   const skills = [];
+  const commands = [];
   const ctx = {
     options,
     app: { name: "opencode", version: "2.2.0", channel: "dev" },
@@ -65,10 +66,20 @@ export function makeHost({ options = {}, agentSystem = "You are a coding agent."
       },
       reload: async () => {},
     },
+    command: {
+      transform: async (cb) => {
+        const added = [];
+        cb({ add: (def) => added.push(def), list: () => added });
+        commands.push(...added);
+        return { dispose: async () => {} };
+      },
+      reload: async () => {},
+      list: async () => commands,
+    },
     storage: { get: async () => undefined, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) },
     experimental: {},
   };
-  return { ctx, fire, agents, tools, skills };
+  return { ctx, fire, agents, tools, skills, commands };
 }
 
 export { Schema };

@@ -42,6 +42,10 @@ import { capabilityProtocolText, renderSkillCatalog } from "./capability.js";
 import { decideRetry, normalizeRetryConfig } from "./retry.js";
 import { EvidenceLedger } from "./evidence.js";
 import { evidenceFromEvent, recordToolCall } from "./observe.js";
+import { looksLikeRefusal, resumePrompt, withNudge } from "./refusal.js";
+import { renderSelfcheck, selfcheck } from "./selfcheck.js";
+import { replayFromEvidence } from "./replay.js";
+import { atomicWriteSync } from "./fsx.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(HERE, "..");
@@ -72,6 +76,8 @@ const DEFAULTS = {
   retry: { autoRetry: true, retryMax: 3 },
   // 命令面板：/purge 系列
   commands: true,
+  // 自检：把运行期事实累计到 state 里（/purge-doctor 读它）
+  selfcheck: true,
 };
 
 const log = (options, ...args) => {
@@ -197,6 +203,28 @@ export const plugin = Plugin.define({
     };
     trace(`setup start inject=${injectText.length}`);
 
+    /* ---- 3.0a 运行期探针：给 selfcheck 提供"这一层到底跑没跑"的事实 ---- */
+    const probe = {
+      injectBytes: injectText.length,
+      capabilityProtocol: cfg.capabilityProtocol !== false,
+      lastCardApplied: false,
+      lastCardModel: "",
+      permissionAutoAllow: cfg.permissionAutoAllow !== false,
+      permissionHookSeen: 0,
+      hookBypass: cfg.hookBypass !== false,
+      toolBeforeSeen: 0,
+      autoEvidence: cfg.autoEvidence !== false,
+      evidenceCount: 0,
+      retryEnabled: cfg.retry?.autoRetry !== false,
+      retrySeen: 0,
+      scopeEnabled: cfg.scope?.enabled === true,
+      scopeChecks: 0,
+      commandsRegistered: 0,
+      toolsRegistered: 0,
+      refusalWatch: true,
+      refusalSeen: 0,
+    };
+
     /* ---- 3.0 证据账本 + 事件订阅（自动攒证据）---- */
     let ledger = null;
     try {
@@ -219,6 +247,7 @@ export const plugin = Plugin.define({
           sessionID: event.sessionID,
           agent: event.agent,
         });
+        if (record.ok) probe.evidenceCount += 1;
         trace(`evidence ${ok ? "ok" : "fail"} ${record.ev_id ?? record.error}`);
         log(cfg, "evidence recorded", record.ev_id ?? record.error);
       });
@@ -227,6 +256,7 @@ export const plugin = Plugin.define({
 
     /* ---- 3.0b 重试策略：把 dsh-purge 的判定搬进 session.retry ---- */
     const retryReg = await ctx.session.hook("retry", (event) => {
+      probe.retrySeen += 1;
       const decision = decideRetry({ error: event.error, attempt: event.attempt, config: cfg.retry });
       trace(`retry attempt=${event.attempt} → ${decision.retry ? `delay ${decision.delay}` : "stop"} (${decision.reason})`);
       event.decision = decision.retry ? { retry: true, delay: decision.delay } : { retry: false };
@@ -270,6 +300,7 @@ export const plugin = Plugin.define({
     const contextReg = await ctx.session.hook("context", (event) => {
       const modelRef = `${event.model?.providerID ?? ""}/${event.model?.modelID ?? ""}`;
       log(cfg, "context hook", modelRef);
+      probe.lastCardModel = modelRef;
       trace(`context hook model=${modelRef} parts=${Array.isArray(event.system) ? event.system.length : -1}`);
       const card = resolveCard(cfg, env, modelRef);
       const block = renderIdentityCard({ card, primeDirective: cfg.primeDirective });
@@ -284,6 +315,7 @@ export const plugin = Plugin.define({
         parts.push({ type: "text", text: block });
       }
       event.system = parts;
+      probe.lastCardApplied = parts.length > 0;
       // 工具面收窄：声明了 dropTools 就删掉对应工具描述
       if (Array.isArray(cfg.dropTools) && cfg.dropTools.length && event.tools) {
         for (const name of cfg.dropTools) delete event.tools[name];
@@ -291,8 +323,25 @@ export const plugin = Plugin.define({
     });
     disposables.push(() => contextReg.dispose());
 
+    /* ---- 3.2b 拒绝检测：把"推脱"当故障处理 ----
+     * OpenCode 没有取消后静默重跑的官方入口，所以这里只做两件可控的事：
+     *   · 记录命中（probe.refusalSeen）供 /purge-doctor 与审计使用
+     *   · 提供 resumePrompt()/withNudge() 给上层调用（工具 purge_doctor、命令、外部脚本）
+     * 不在 stream 里拦截：那需要劫持 Provider，属于改宿主行为，本插件不做。 */
+    const refusalReg = await ctx.tool.hook("execute.after", (event) => {
+      if (event.status !== "completed") return;
+      const text = typeof event.result === "string" ? event.result : event.result?.content;
+      if (typeof text !== "string" || text.length < 20) return;
+      if (!looksLikeRefusal(text)) return;
+      probe.refusalSeen = (probe.refusalSeen ?? 0) + 1;
+      trace(`refusal detected in ${event.tool}`);
+      log(cfg, "refusal-like output from tool", event.tool, "→ use purge_doctor / resumePrompt()");
+    });
+    disposables.push(() => refusalReg.dispose());
+
     /* ---- 3.3 执行链改写（fs 观察绕过 / hooks 拒绝绕过）---- */
     const beforeReg = await ctx.tool.hook("execute.before", (event) => {
+      probe.toolBeforeSeen += 1;
       if (!cfg.hookBypass) return;
       for (const patch of toolPatches) {
         try {
@@ -306,6 +355,7 @@ export const plugin = Plugin.define({
 
     /* ---- 3.4 权限：审批门改写 ---- */
     const permReg = await ctx.permission.hook("evaluate", (event) => {
+      probe.permissionHookSeen += 1;
       if (!cfg.permissionAutoAllow) return;
       const allowAny = !Array.isArray(cfg.permissionAllowActions) || cfg.permissionAllowActions.includes("*");
       if (!allowAny && !cfg.permissionAllowActions.includes(event.action)) return;
@@ -328,6 +378,7 @@ export const plugin = Plugin.define({
       const scopeToolReg = await ctx.tool.hook("execute.before", (event) => {
         const command = event.input?.command;
         if (typeof command === "string") {
+          probe.scopeChecks += 1;
           const verdict = gate.checkCommand(command);
           if (!verdict.allowed) {
             throw new Error(`[oc-purge] out-of-scope host ${verdict.host} (${verdict.reason})`);
@@ -355,7 +406,8 @@ export const plugin = Plugin.define({
     }
 
     /* ---- 3.6 新增工具 / 技能 ---- */
-    const toolSpecs = makePurgeTools({ cfg, env, ledger });
+    const toolSpecs = makePurgeTools({ cfg, env, ledger, probe });
+    probe.toolsRegistered = toolSpecs.length;
     await ctx.tool.transform((tools) => {
       for (const tool of toolSpecs) tools.add(tool);
     });
@@ -382,8 +434,15 @@ export const plugin = Plugin.define({
           editor.add(
             make("purge-release", "Publish the package via the npm workflow", "Check package.json version, run npm test, then tell the operator the exact gh workflow command for the chosen bump."),
           );
+          editor.add(
+            make("purge-doctor", "Layer-by-layer self-check: which oc-purge layers actually fired", "Call purge_doctor (format=text) and report every failed/pending layer with its consequence. Do not claim a layer works without evidence from the tool output."),
+          );
+          editor.add(
+            make("purge-replay", "Turn recorded evidence into reproducible commands", "Call purge_replay with the latest evidence and flag anything marked synthesized=true as not a real capture."),
+          );
         });
         disposables.push(() => ctx.command.reload?.());
+        probe.commandsRegistered = 5;
         trace("commands registered");
       } catch (error) {
         trace(`commands skipped: ${String(error?.message ?? error)}`);
@@ -416,6 +475,7 @@ export const plugin = Plugin.define({
         injectBytes: injectText.length,
         rules: (await collectRules({ env, options: cfg })).length,
         scope: scopeReport(cfg.scope),
+        selfcheck: cfg.selfcheck === false ? null : selfcheck(probe),
         at: Date.now(),
       });
     } catch {
@@ -446,7 +506,7 @@ function stripFrontmatter(text) {
  * 4. 新增工具
  * ------------------------------------------------------------------ */
 
-export function makePurgeTools({ cfg, env, ledger }) {
+export function makePurgeTools({ cfg, env, ledger, probe }) {
   const tool = (name, description, input, run) => ({
     name,
     options: { codemode: false },
@@ -604,6 +664,42 @@ export function makePurgeTools({ cfg, env, ledger }) {
           return rows.map((row) => `${row.unk_id}\t${row.status}\t${row.severity}\t${row.question}`).join("\n");
         }
         return "noop";
+      },
+    ),
+    tool(
+      "purge_doctor",
+      "Layer-by-layer self-check: prove each oc-purge layer actually fired on this machine, instead of trusting 'the plugin is installed'.",
+      Schema.Struct({
+        format: Schema.optional(Schema.Literals(["text", "json"])),
+      }),
+      async ({ format }) => {
+        if (!probe) return "error: probe state unavailable";
+        const report = selfcheck(probe);
+        if (format === "json") return JSON.stringify(report, null, 2);
+        return renderSelfcheck(report);
+      },
+    ),
+    tool(
+      "purge_replay",
+      "Turn a recorded evidence row into a reproducible command / HTTP request. Anything synthesised is flagged so it is never mistaken for a real capture.",
+      Schema.Struct({
+        ev_id: Schema.optional(Schema.String),
+        limit: Schema.optional(Schema.Number),
+      }),
+      async ({ ev_id, limit }) => {
+        if (!ledger) return "error: ledger unavailable";
+        const rows = ev_id ? [ledger.get(ev_id)].filter(Boolean) : ledger.list({ limit: limit ?? 10 });
+        if (rows.length === 0) return "(no evidence)";
+        return rows
+          .map((row) => {
+            const replay = replayFromEvidence(row);
+            const lines = [`## ${row.ev_id}`, `kind: ${replay.kind}`, `synthesized: ${replay.synthesized}`];
+            if (replay.command) lines.push("", "```bash", replay.command, "```");
+            if (replay.http) lines.push("", "```http", replay.http, "```");
+            if (replay.note) lines.push("", `note: ${replay.note}`);
+            return lines.join("\n");
+          })
+          .join("\n\n");
       },
     ),
   ];

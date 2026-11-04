@@ -80,6 +80,10 @@ msg="loading plugin" id=/path/to/oc-purge entrypoint=file:///path/to/oc-purge/sr
 | 自动落账 | `tool.execute.after` → 账本 | 手动 record |
 | 重试判定 | `session.hook("retry")` | `lib/continue-retry.js` |
 | 能力选用协议 | `src/capability.js` 注入 | `lib/capability-protocol.js` |
+| 分层自检 | `src/selfcheck.js` + `purge_doctor` | `lib/selfcheck.js`（社区版） |
+| 拒绝检测 | `src/refusal.js` | `lib/refusal-retry.js`（社区版） |
+| 复现材料 | `src/replay.js` + `purge_replay` | `lib/redteam/report-replay.js` |
+| 原子写 / 路径围栏 | `src/fsx.js` | `lib/atomic-files.js` + `path-boundary.js`（社区版） |
 
 核心差异：dsh-purge 62 条补丁里，一大半（`extract-asar`、`restart-desktop`、`official-update`…）是因为 DSH 没有插件级扩展点才被迫改宿主。OpenCode 有正式扩展点，**这类补丁直接消失**。
 
@@ -142,13 +146,15 @@ oc-purge/
 | `purge_inject` | 读写自由注入文本 |
 | `purge_scope` | 判定某主机是否在作用域内 |
 | `purge_evidence` | 证据 `record` / `verify` / `list` / `stats` / Residual Unknown 全流程 |
+| `purge_doctor` | 11 层自检：哪层真的跑了、哪层还 pending、哪层 failed |
+| `purge_replay` | 把证据变成可跑的 curl / HTTP 报文，合成内容标 `synthesized: true` |
 
-命令：`/purge-status`、`/purge-evidence`、`/purge-release`。
+命令：`/purge-status`、`/purge-evidence`、`/purge-release`、`/purge-doctor`、`/purge-replay`。
 
 证据账本按**语义哈希**寻址：同样内容同一个 `ev_` id，改一个字就变。
 所以子智能体回报的 `claimed` 可以被指挥侧用 `verify` 精确比对。
 
-细节见 [docs/UPGRADE-0.3.md](docs/UPGRADE-0.3.md)。
+细节见 [docs/UPGRADE-0.3.md](docs/UPGRADE-0.3.md) 与 [docs/UPGRADE-0.4.md](docs/UPGRADE-0.4.md)。
 
 ---
 
@@ -176,7 +182,7 @@ oc-purge/
 
 ```bash
 npm install        # 只装 effect
-npm test           # 41 项
+npm test           # 87 项
 node --check src/index.js
 ```
 

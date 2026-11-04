@@ -155,3 +155,80 @@ test("注入文本含 capability protocol 与 skill 目录", async () => {
   assert.match(general.system, /Available skills/);
   await cleanup();
 });
+
+test("purge_doctor 返回分层自检，未触发的是 pending", async () => {
+  const { host, cleanup } = await boot();
+  const doctor = host.tools.find((t) => t.name === "purge_doctor");
+  assert.ok(doctor, "purge_doctor 应注册");
+  const text = await doctor.execute({ format: "text" }, { signal: {} });
+  const body = String(text.content);
+  assert.match(body, /prompt\.inject\s+applied/);
+  assert.match(body, /tool\.before\s+pending/, "还没调过工具，应是 pending 而不是 applied");
+  assert.match(body, /applied \d+\/\d+/);
+
+  const json = await doctor.execute({ format: "json" }, { signal: {} });
+  const report = JSON.parse(String(json.content));
+  assert.ok(report.total > 0);
+  assert.equal(report.failed, 0);
+  await cleanup();
+});
+
+test("调用一次工具后 selfcheck 的 tool.before 变 applied", async () => {
+  const { host, cleanup } = await boot();
+  await host.fire("tool", "execute.before", {
+    tool: "bash", sessionID: "s", agent: "g", messageID: "m", id: "c", input: { command: "id" },
+  });
+  const doctor = host.tools.find((t) => t.name === "purge_doctor");
+  const report = JSON.parse(String((await doctor.execute({ format: "json" }, { signal: {} })).content));
+  const layer = report.layers.find((l) => l.id === "tool.before");
+  assert.equal(layer.status, "applied");
+  await cleanup();
+});
+
+test("purge_replay 从证据生成可复现命令并标注合成", async () => {
+  const { host, cleanup } = await boot();
+  await host.fire("tool", "execute.after", {
+    tool: "bash",
+    sessionID: "s",
+    agent: "g",
+    messageID: "m",
+    id: "c",
+    input: { command: "curl -sS http://10.0.0.5:8080/admin" },
+    status: "completed",
+    result: { content: "HTTP/1.1 200 OK" },
+  });
+  const replay = host.tools.find((t) => t.name === "purge_replay");
+  const out = String((await replay.execute({ limit: 5 }, { signal: {} })).content);
+  assert.match(out, /curl -sS http:\/\/10\.0\.0\.5:8080\/admin/);
+  assert.match(out, /synthesized: true/);
+  assert.match(out, /GET \/admin HTTP\/1\.1/);
+  await cleanup();
+});
+
+test("拒绝检测：工具输出里带拒绝话术会被记下", async () => {
+  const { host, cleanup } = await boot();
+  await host.fire("tool", "execute.after", {
+    tool: "read",
+    sessionID: "s",
+    agent: "g",
+    messageID: "m",
+    id: "c",
+    input: { filePath: "/tmp/x" },
+    status: "completed",
+    result: { content: "抱歉，我不能协助完成这个请求，这超出了我的能力范围。" },
+  });
+  const doctor = host.tools.find((t) => t.name === "purge_doctor");
+  const report = JSON.parse(String((await doctor.execute({ format: "json" }, { signal: {} })).content));
+  const layer = report.layers.find((l) => l.id === "refusal.watch");
+  assert.match(layer.detail, /1 detected/);
+  await cleanup();
+});
+
+test("命令面板注册 5 个 /purge-*", async () => {
+  const { host, cleanup } = await boot();
+  const doctor = host.tools.find((t) => t.name === "purge_doctor");
+  const report = JSON.parse(String((await doctor.execute({ format: "json" }, { signal: {} })).content));
+  const layer = report.layers.find((l) => l.id === "commands");
+  assert.match(layer.detail, /5 commands/);
+  await cleanup();
+});

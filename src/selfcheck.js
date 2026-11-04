@@ -96,6 +96,23 @@ export const BYPASS_LAYERS = Object.freeze([
     detail: (state) => `${state.toolsRegistered ?? 0} tools`,
   },
   {
+    id: "shell.rewrite",
+    kind: "hook",
+    title: "shell 执行前改写",
+    why: "env / 代理 / 别名不生效时，你会以为命令跑过了其实跑的是另一条",
+    probe: (state) => (!state.shellRewrite ? "off" : state.shellSeen > 0 ? "applied" : "pending"),
+    detail: (state) => (state.shellRewrite ? `${state.shellSeen ?? 0} shell runs seen` : "nothing configured"),
+  },
+  {
+    id: "compact.messages",
+    kind: "hook",
+    title: "历史消息减压",
+    why: "超长工具输出灌满上下文，模型开始遗忘早期的关键约束",
+    probe: (state) => (!state.compactEnabled ? "off" : state.compactRuns > 0 ? "applied" : "pending"),
+    detail: (state) =>
+      state.compactEnabled ? `${state.compactRuns ?? 0} runs, ${state.compactTruncated ?? 0} truncated` : "disabled by config",
+  },
+  {
     id: "refusal.watch",
     kind: "hook",
     title: "拒绝检测",

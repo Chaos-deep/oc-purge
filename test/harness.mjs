@@ -59,6 +59,7 @@ export function makeHost({ options = {}, agentSystem = "You are a coding agent."
       list: async () => tools,
     },
     permission: { hook: (name, cb) => add("permission", name, cb) },
+    shell: { hook: (name, cb) => add("shell", name, cb) },
     skill: {
       transform: async (cb) => {
         cb({ list: () => skills, get: (id) => skills.find((s) => s.id === id), add: (s) => skills.push(s), update: () => {}, remove: () => {} });

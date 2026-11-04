@@ -84,6 +84,8 @@ msg="loading plugin" id=/path/to/oc-purge entrypoint=file:///path/to/oc-purge/sr
 | 拒绝检测 | `src/refusal.js` | `lib/refusal-retry.js`（社区版） |
 | 复现材料 | `src/replay.js` + `purge_replay` | `lib/redteam/report-replay.js` |
 | 原子写 / 路径围栏 | `src/fsx.js` | `lib/atomic-files.js` + `path-boundary.js`（社区版） |
+| shell 执行前改写 | `shell.hook("create.before")` | `lib/net-scope.js` 的出网拦截 |
+| 历史消息减压 | `session.hook("context")` → `messages` | 无（OpenCode 独有） |
 
 核心差异：dsh-purge 62 条补丁里，一大半（`extract-asar`、`restart-desktop`、`official-update`…）是因为 DSH 没有插件级扩展点才被迫改宿主。OpenCode 有正式扩展点，**这类补丁直接消失**。
 
@@ -129,6 +131,8 @@ oc-purge/
 | `autoEvidence` | `true` | 从 `tool.execute.after` 自动落账 |
 | `retry` | `{autoRetry:true, retryMax:3}` | 重试策略，见 `src/retry.js` |
 | `commands` | `true` | 注册 `/purge-status` 等命令 |
+| `shell` | `{declareEnv:{}, aliases:{}, prepend:"", proxy:"", deny:[]}` | 命令执行前改写，见 `src/shexec.js` |
+| `compact` | `{enabled:false, maxToolOutputChars:8000}` | 派发前减压历史消息 |
 
 环境变量：
 
@@ -154,7 +158,7 @@ oc-purge/
 证据账本按**语义哈希**寻址：同样内容同一个 `ev_` id，改一个字就变。
 所以子智能体回报的 `claimed` 可以被指挥侧用 `verify` 精确比对。
 
-细节见 [docs/UPGRADE-0.3.md](docs/UPGRADE-0.3.md) 与 [docs/UPGRADE-0.4.md](docs/UPGRADE-0.4.md)。
+细节见 [docs/UPGRADE-0.3.md](docs/UPGRADE-0.3.md)、[docs/UPGRADE-0.4.md](docs/UPGRADE-0.4.md)、[docs/UPGRADE-0.5.md](docs/UPGRADE-0.5.md)。
 
 ---
 
@@ -182,7 +186,7 @@ oc-purge/
 
 ```bash
 npm install        # 只装 effect
-npm test           # 87 项
+npm test           # 115 项
 node --check src/index.js
 ```
 

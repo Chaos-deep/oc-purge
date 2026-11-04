@@ -46,6 +46,8 @@ import { looksLikeRefusal, resumePrompt, withNudge } from "./refusal.js";
 import { renderSelfcheck, selfcheck } from "./selfcheck.js";
 import { replayFromEvidence } from "./replay.js";
 import { atomicWriteSync } from "./fsx.js";
+import { rewriteShell } from "./shexec.js";
+import { compactMessages, DEFAULT_COMPACT } from "./compact.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(HERE, "..");
@@ -78,6 +80,10 @@ const DEFAULTS = {
   commands: true,
   // 自检：把运行期事实累计到 state 里（/purge-doctor 读它）
   selfcheck: true,
+  // shell 执行前改写（env / alias / 前缀 / 代理 / 拒绝）
+  shell: { declareEnv: {}, aliases: {}, prepend: "", proxy: "", deny: [] },
+  // 派发前给历史消息减压（默认关）
+  compact: { ...DEFAULT_COMPACT },
 };
 
 const log = (options, ...args) => {
@@ -90,6 +96,8 @@ function config(options) {
   merged.cardByModel = merged.cardByModel && typeof merged.cardByModel === "object" ? merged.cardByModel : {};
   merged.scope = { ...DEFAULTS.scope, ...(merged.scope || {}) };
   merged.retry = normalizeRetryConfig({ ...DEFAULTS.retry, ...(merged.retry || {}) });
+  merged.shell = { ...DEFAULTS.shell, ...(merged.shell || {}) };
+  merged.compact = { ...DEFAULTS.compact, ...(merged.compact || {}) };
   return merged;
 }
 
@@ -223,6 +231,11 @@ export const plugin = Plugin.define({
       toolsRegistered: 0,
       refusalWatch: true,
       refusalSeen: 0,
+      shellRewrite: Boolean(cfg.shell && Object.keys(cfg.shell.declareEnv || {}).length + (cfg.shell.aliases ? Object.keys(cfg.shell.aliases).length : 0) + (cfg.shell.prepend ? 1 : 0) + (cfg.shell.proxy ? 1 : 0) + (cfg.shell.deny ? cfg.shell.deny.length : 0)) ,
+      shellSeen: 0,
+      compactEnabled: cfg.compact?.enabled === true,
+      compactRuns: 0,
+      compactTruncated: 0,
     };
 
     /* ---- 3.0 证据账本 + 事件订阅（自动攒证据）---- */
@@ -338,6 +351,45 @@ export const plugin = Plugin.define({
       log(cfg, "refusal-like output from tool", event.tool, "→ use purge_doctor / resumePrompt()");
     });
     disposables.push(() => refusalReg.dispose());
+
+    /* ---- 3.2c shell 执行前改写 ----
+     * 宿主在 packages/core/src/shell.ts:284 触发 create.before，事件可变。
+     * 命中 deny 直接抛错 —— 这是 scope 之外的第二道闸，作用在最底层（任何工具最终都落到 shell）。 */
+    if (ctx.shell?.hook) {
+      try {
+        const shellReg = await ctx.shell.hook("create.before", (event) => {
+          probe.shellSeen += 1;
+          const out = rewriteShell(event, cfg.shell);
+          if (out.denied) {
+            trace(`shell denied: ${out.denied}`);
+            throw new Error(`[oc-purge] command denied: ${out.denied}`);
+          }
+          if (!out.changed) return;
+          event.command = out.command;
+          event.env = out.env;
+          trace("shell rewritten");
+        });
+        disposables.push(() => shellReg.dispose());
+      } catch (error) {
+        trace(`shell hook unavailable: ${String(error?.message ?? error)}`);
+      }
+    }
+
+    /* ---- 3.2d 派发前给历史消息减压（默认关）---- */
+    if (cfg.compact?.enabled && ctx.session?.hook) {
+      const compactReg = await ctx.session.hook("context", (event) => {
+        if (!Array.isArray(event.messages)) return;
+        const out = compactMessages(event.messages, cfg.compact);
+        if (out.stats.skipped) return;
+        event.messages = out.messages;
+        probe.compactRuns += 1;
+        probe.compactTruncated += out.stats.truncated;
+        if (out.stats.truncated || out.stats.deduped) {
+          trace(`compact truncated=${out.stats.truncated} deduped=${out.stats.deduped}`);
+        }
+      });
+      disposables.push(() => compactReg.dispose());
+    }
 
     /* ---- 3.3 执行链改写（fs 观察绕过 / hooks 拒绝绕过）---- */
     const beforeReg = await ctx.tool.hook("execute.before", (event) => {

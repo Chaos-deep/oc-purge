@@ -21,11 +21,13 @@
 - `src/selfcheck.js` 的分母口径：只有 `off`/`na`/`disabled` 算不适用，`pending` 必须留在分母里。
   改成"pending 也算通过"就等于自检永远 100%，这条被测试锁住（`test/selfcheck.test.mjs`）。
 - `src/replay.js` 合成出来的请求必须带 `synthesized: true`，不允许和真实抓包混为一谈。
+- `src/shexec.js` 不解析 shell 语法：只做「首词替换 + 前缀 + 正则拒绝」。任何"顺手改一下管道后半段"的想法都属于越界。
+- `src/compact.js` 只截断内容、**不删消息条目** —— 删了会让 tool_call/tool_result 配对断裂，宿主直接报错。
 
 ## 命令
 
 ```bash
-npm test                        # 87 项，全绿才算可发布（内置 @opencode/plugin 替身）
+npm test                        # 115 项，全绿才算可发布（内置 @opencode/plugin 替身）
 node --check src/index.js
 ```
 

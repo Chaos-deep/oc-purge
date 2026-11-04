@@ -232,3 +232,79 @@ test("命令面板注册 5 个 /purge-*", async () => {
   assert.match(layer.detail, /5 commands/);
   await cleanup();
 });
+
+test("shell hook 注入 env 与别名", async () => {
+  const { host, cleanup } = await boot({
+    shell: { declareEnv: { OC_MARK: "1" }, aliases: { ls: "ls --color=never" } },
+  });
+  const event = { command: "ls -la", cwd: "/tmp", timeout: 0, shell: "/bin/bash", env: { PATH: "/usr/bin" } };
+  await host.fire("shell", "create.before", event);
+  assert.equal(event.command, "ls --color=never -la");
+  assert.equal(event.env.OC_MARK, "1");
+  assert.equal(event.env.PATH, "/usr/bin", "原有 env 不能被冲掉");
+  await cleanup();
+});
+
+test("shell hook 命中 deny 抛错", async () => {
+  // deny 里是正则字符串：`rm -rf /` 要匹配任意以它开头的删除
+  const { host, cleanup } = await boot({ shell: { deny: ["rm\\s+-rf\\s+/(?!tmp)"] } });
+  const event = { command: "rm -rf /etc", cwd: "/", timeout: 0, shell: "/bin/bash", env: {} };
+  await assert.rejects(() => host.fire("shell", "create.before", event), /command denied/);
+  await cleanup();
+});
+
+test("shell deny 不误伤 /tmp", async () => {
+  const { host, cleanup } = await boot({ shell: { deny: ["rm\\s+-rf\\s+/(?!tmp)"] } });
+  const event = { command: "rm -rf /tmp/x", cwd: "/", timeout: 0, shell: "/bin/bash", env: {} };
+  await host.fire("shell", "create.before", event);
+  assert.equal(event.command, "rm -rf /tmp/x");
+  await cleanup();
+});
+
+test("compact 关闭时不动 messages", async () => {
+  const { host, cleanup } = await boot();
+  const long = "x".repeat(50_000);
+  const event = {
+    sessionID: "s",
+    model: { providerID: "p", modelID: "m" },
+    system: [{ type: "text", text: "sys" }],
+    messages: [{ role: "user", content: [{ type: "tool-result", text: long }] }],
+    options: {},
+    agent: "g",
+    tools: {},
+  };
+  await host.fire("session", "context", event);
+  assert.equal(event.messages[0].content[0].text.length, 50_000);
+  await cleanup();
+});
+
+test("compact 开启后截断并计数", async () => {
+  const { host, cleanup } = await boot({ compact: { enabled: true, maxToolOutputChars: 500, keepTailChars: 100 } });
+  const event = {
+    sessionID: "s",
+    model: { providerID: "p", modelID: "m" },
+    system: [{ type: "text", text: "sys" }],
+    messages: [{ role: "user", content: [{ type: "tool-result", text: "A".repeat(5_000) }] }],
+    options: {},
+    agent: "g",
+    tools: {},
+  };
+  await host.fire("session", "context", event);
+  assert.match(event.messages[0].content[0].text, /truncated by oc-purge/);
+  const doctor = host.tools.find((t) => t.name === "purge_doctor");
+  const report = JSON.parse(String((await doctor.execute({ format: "json" }, { signal: {} })).content));
+  const layer = report.layers.find((l) => l.id === "compact.messages");
+  assert.equal(layer.status, "applied");
+  assert.match(layer.detail, /1 routed|1 runs/);
+  await cleanup();
+});
+
+test("doctor 报告 shell.rewrite 层", async () => {
+  const { host, cleanup } = await boot({ shell: { declareEnv: { X: "1" } } });
+  await host.fire("shell", "create.before", { command: "ls", cwd: "/", timeout: 0, shell: "/bin/bash", env: {} });
+  const doctor = host.tools.find((t) => t.name === "purge_doctor");
+  const report = JSON.parse(String((await doctor.execute({ format: "json" }, { signal: {} })).content));
+  const layer = report.layers.find((l) => l.id === "shell.rewrite");
+  assert.equal(layer.status, "applied");
+  await cleanup();
+});

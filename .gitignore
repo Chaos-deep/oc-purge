@@ -4,6 +4,10 @@ test/.ocpurge-home*/
 package-lock.json
 *.tgz
 
+# editor / IDE
+.idea/
+.vscode/
+
 # local runtime data (not part of the plugin code)
 rules/
 cards/
